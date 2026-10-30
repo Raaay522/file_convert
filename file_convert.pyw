@@ -1,8 +1,9 @@
-"""JPG 轉 PDF：JPEG 原始資料直接嵌入 PDF，不重新壓縮、畫質不變。
+"""格式轉換：圖片互轉、圖片與 PDF 合併成 PDF、PDF 轉圖片。JPG 轉 PDF 時原始資料直接嵌入，不重新壓縮。
 
-python jpg_to_pdf.pyw                                  開視窗
-python jpg_to_pdf.pyw a.jpg b.jpg 資料夾                開視窗並先加入圖片（把圖片拖到本檔圖示上也一樣）
-python jpg_to_pdf.pyw a.jpg b.jpg --out 輸出.pdf        不開視窗，直接輸出
+python file_convert.pyw                                        開視窗
+python file_convert.pyw a.jpg b.png 報告.pdf 資料夾             開視窗並先加入檔案（把檔案拖到本檔圖示上也一樣）
+python file_convert.pyw a.jpg b.png --out 輸出.pdf              不開視窗，合併成 PDF
+python file_convert.pyw 照片資料夾 --to webp --out 輸出資料夾    不開視窗，轉成其他圖片格式
 """
 import argparse
 import io
@@ -12,6 +13,7 @@ import re
 import sys
 import threading
 import time
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 
 from PIL import Image, ImageDraw, ImageFilter, ImageOps
@@ -21,7 +23,22 @@ MM = 72 / 25.4
 MAX_PAGE = 14400  # PDF 頁面邊長上限（pt）
 MARGIN_MM = {"none": 0, "small": 10, "large": 20}
 COLOR_SPACE = {"L": "DeviceGray", "RGB": "DeviceRGB", "CMYK": "DeviceCMYK"}
-IMAGE_EXT = (".jpg", ".jpeg")
+IMAGE_EXT = (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff", ".gif", ".avif")
+PDF_EXT = (".pdf",)
+# 輸出格式：Pillow 格式名、副檔名、可直接存的色彩模式
+FORMATS = {
+    "jpg": ("JPEG", ".jpg", ("L", "RGB", "CMYK")),
+    "png": ("PNG", ".png", ("1", "L", "LA", "P", "RGB", "RGBA", "I;16")),
+    "webp": ("WEBP", ".webp", ("RGB", "RGBA")),
+    "bmp": ("BMP", ".bmp", ("1", "L", "P", "RGB")),
+    "tiff": ("TIFF", ".tiff", ("1", "L", "LA", "P", "RGB", "RGBA", "CMYK", "I;16")),
+    "gif": ("GIF", ".gif", ("1", "L", "P", "RGB", "RGBA")),
+    "avif": ("AVIF", ".avif", ("RGB", "RGBA")),
+}
+KEEPS_ALPHA = {"png", "webp", "tiff", "gif", "avif"}
+LOSSY = {"jpg", "webp", "avif"}
+QUALITY = {"high": 95, "medium": 85, "low": 70}
+ROTATE = {90: Image.Transpose.ROTATE_270, 180: Image.Transpose.ROTATE_180, 270: Image.Transpose.ROTATE_90}
 
 
 def natural_key(path):
@@ -29,35 +46,63 @@ def natural_key(path):
     return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", name)]
 
 
+def is_pdf(path):
+    return path.lower().endswith(PDF_EXT)
+
+
+def supported(path):
+    return path.lower().endswith(IMAGE_EXT + PDF_EXT)
+
+
 def expand(paths):
-    """資料夾展開成其中的 JPG，依檔名自然排序。"""
+    """資料夾展開成其中的圖片與 PDF，依檔名自然排序。"""
     files = []
     for p in paths:
         if os.path.isdir(p):
-            files += sorted((os.path.join(p, n) for n in os.listdir(p) if n.lower().endswith(IMAGE_EXT)),
-                            key=natural_key)
+            files += sorted((os.path.join(p, n) for n in os.listdir(p) if supported(n)), key=natural_key)
         else:
             files.append(p)
     return [os.path.normpath(p) for p in files]
 
 
-def read_jpeg(path):
-    """回傳 JPEG 資料與嵌入需要的資訊；能直接嵌入就不重新壓縮。"""
+def has_alpha(im):
+    return im.mode in ("RGBA", "LA", "PA") or (im.mode == "P" and "transparency" in im.info)
+
+
+def flatten(im):
+    """透明部分鋪白底。"""
+    im = im.convert("RGBA")
+    bg = Image.new("RGB", im.size, "white")
+    bg.paste(im, mask=im.getchannel("A"))
+    return bg
+
+
+def open_pdf(path):
+    import fitz
+    doc = fitz.open(path)
+    if doc.needs_pass:
+        raise RuntimeError("PDF 有密碼保護")
+    return doc
+
+
+# ---------- 轉成 PDF ----------
+
+def read_for_pdf(path):
+    """回傳嵌入 PDF 需要的影像資料；JPEG 能直接嵌入就不重新壓縮，其他格式無損壓縮。"""
     with Image.open(path) as im:
         orientation = im.getexif().get(0x0112, 1)
         dpi = im.info.get("dpi", (0, 0))[0]
         if im.format == "JPEG" and im.mode in COLOR_SPACE and orientation in (1, 3, 6, 8):
             with open(path, "rb") as f:
                 data = f.read()
-            adobe_cmyk = im.mode == "CMYK" and "adobe" in im.info
-            return data, im.size, im.mode, adobe_cmyk, orientation, dpi
-        # 鏡像方向或非 JPEG：轉正後以高畫質重新壓縮
+            decode = " /Decode [1 0 1 0 1 0 1 0]" if im.mode == "CMYK" and "adobe" in im.info else ""
+            return data, im.size, im.mode, "DCTDecode", decode, orientation, dpi
         im = ImageOps.exif_transpose(im)
-        if im.mode not in ("L", "RGB"):
-            im = im.convert("RGB")
-        buf = io.BytesIO()
-        im.save(buf, "JPEG", quality=95)
-        return buf.getvalue(), im.size, im.mode, False, 1, dpi
+        if has_alpha(im):
+            im = flatten(im)
+        if im.mode not in COLOR_SPACE:
+            im = im.convert("L" if im.mode == "1" else "RGB")
+        return zlib.compress(im.tobytes(), 6), im.size, im.mode, "FlateDecode", "", 1, dpi
 
 
 def page_geometry(dw, dh, dpi, page="a4", orient="auto", margin="none"):
@@ -68,7 +113,7 @@ def page_geometry(dw, dh, dpi, page="a4", orient="auto", margin="none"):
         m = MARGIN_MM[margin] * MM
         s = min((pw - 2 * m) / dw, (ph - 2 * m) / dh)
     else:
-        s = 72 / (dpi if dpi and dpi >= 1 else 96)
+        s = 72 / (dpi if dpi and 36 <= dpi <= 1200 else 96)  # 沒有或不合理的 DPI（例如 TIFF 預設 1）當 96
         s = min(s, MAX_PAGE / max(dw, dh))
         pw, ph = dw * s, dh * s
     iw, ih = dw * s, dh * s
@@ -88,65 +133,170 @@ def num(v):
     return f"{v:.3f}".rstrip("0").rstrip(".") or "0"
 
 
-def write_pdf(items, out, page="a4", orient="auto", margin="none", progress=None):
+def write_image_pdf(items, out, page="a4", orient="auto", margin="none", progress=None):
     """items：[(圖片路徑, 順時針旋轉角度)]，每張一頁。"""
     n = len(items)
     offsets = [0] * (3 + 3 * n)
-    tmp = out + ".part"
-    try:
-        with open(tmp, "wb") as f:
-            def put(i, head, stream=None):
-                offsets[i] = f.tell()
-                f.write(f"{i} 0 obj\n{head}\n".encode())
-                if stream is not None:
-                    f.write(b"stream\n" + stream + b"\nendstream\n")
-                f.write(b"endobj\n")
+    with open(out, "wb") as f:
+        def put(i, head, stream=None):
+            offsets[i] = f.tell()
+            f.write(f"{i} 0 obj\n{head}\n".encode())
+            if stream is not None:
+                f.write(b"stream\n" + stream + b"\nendstream\n")
+            f.write(b"endobj\n")
 
-            f.write(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
-            put(1, "<< /Type /Catalog /Pages 2 0 R >>")
-            kids = " ".join(f"{3 + 3 * i} 0 R" for i in range(n))
-            put(2, f"<< /Type /Pages /Kids [{kids}] /Count {n} >>")
+        f.write(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+        put(1, "<< /Type /Catalog /Pages 2 0 R >>")
+        kids = " ".join(f"{3 + 3 * i} 0 R" for i in range(n))
+        put(2, f"<< /Type /Pages /Kids [{kids}] /Count {n} >>")
+        for i, (path, rotate) in enumerate(items):
+            try:
+                data, size, mode, codec, decode, orientation, dpi = read_for_pdf(path)
+            except Exception as e:
+                raise RuntimeError(f"{os.path.basename(path)}：{e}") from e
+            dw, dh = size[::-1] if orientation in (6, 8) else size
+            pw, ph, x, y, iw, ih = page_geometry(dw, dh, dpi, page, orient, margin)
+            p, c, m = 3 + 3 * i, 4 + 3 * i, 5 + 3 * i
+            matrix = image_matrix(orientation, x, y, iw, ih)
+            content = f"q {' '.join(num(v) for v in matrix)} cm /Im0 Do Q".encode()
+            rot = f" /Rotate {rotate}" if rotate else ""
+            put(p, f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {num(pw)} {num(ph)}]{rot} "
+                   f"/Resources << /XObject << /Im0 {m} 0 R >> >> /Contents {c} 0 R >>")
+            put(c, f"<< /Length {len(content)} >>", content)
+            put(m, f"<< /Type /XObject /Subtype /Image /Width {size[0]} /Height {size[1]} "
+                   f"/ColorSpace /{COLOR_SPACE[mode]} /BitsPerComponent 8{decode} "
+                   f"/Filter /{codec} /Length {len(data)} >>", data)
+            if progress:
+                progress(i + 1, n)
+        xref = f.tell()
+        f.write(f"xref\n0 {len(offsets)}\n0000000000 65535 f \n".encode())
+        for off in offsets[1:]:
+            f.write(f"{off:010d} 00000 n \n".encode())
+        f.write(f"trailer\n<< /Size {len(offsets)} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode())
+
+
+def write_pdf(items, out, page="a4", orient="auto", margin="none", progress=None):
+    """圖片與 PDF 依序合併成一份 PDF；PDF 頁面原樣複製，A4 等頁面設定只套用在圖片。"""
+    tmp, img_tmp = out + ".part", out + ".images.part"
+    images = [it for it in items if not is_pdf(it[0])]
+    try:
+        if len(images) == len(items):
+            write_image_pdf(items, tmp, page, orient, margin, progress)
+        else:
+            import fitz
+            if images:
+                write_image_pdf(images, img_tmp, page, orient, margin)
+            img_doc = fitz.open(img_tmp) if images else None
+            doc, k = fitz.open(), 0
             for i, (path, rotate) in enumerate(items):
-                try:
-                    data, size, mode, adobe_cmyk, orientation, dpi = read_jpeg(path)
-                except Exception as e:
-                    raise RuntimeError(f"{os.path.basename(path)}：{e}") from e
-                dw, dh = size[::-1] if orientation in (6, 8) else size
-                pw, ph, x, y, iw, ih = page_geometry(dw, dh, dpi, page, orient, margin)
-                p, c, m = 3 + 3 * i, 4 + 3 * i, 5 + 3 * i
-                matrix = image_matrix(orientation, x, y, iw, ih)
-                content = f"q {' '.join(num(v) for v in matrix)} cm /Im0 Do Q".encode()
-                decode = " /Decode [1 0 1 0 1 0 1 0]" if adobe_cmyk else ""
-                rot = f" /Rotate {rotate}" if rotate else ""
-                put(p, f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {num(pw)} {num(ph)}]{rot} "
-                       f"/Resources << /XObject << /Im0 {m} 0 R >> >> /Contents {c} 0 R >>")
-                put(c, f"<< /Length {len(content)} >>", content)
-                put(m, f"<< /Type /XObject /Subtype /Image /Width {size[0]} /Height {size[1]} "
-                       f"/ColorSpace /{COLOR_SPACE[mode]} /BitsPerComponent 8{decode} "
-                       f"/Filter /DCTDecode /Length {len(data)} >>", data)
+                if is_pdf(path):
+                    try:
+                        src = open_pdf(path)
+                    except Exception as e:
+                        raise RuntimeError(f"{os.path.basename(path)}：{e}") from e
+                    start = doc.page_count
+                    doc.insert_pdf(src)
+                    src.close()
+                    for p in range(start, doc.page_count):
+                        doc[p].set_rotation((doc[p].rotation + rotate) % 360)
+                else:
+                    doc.insert_pdf(img_doc, from_page=k, to_page=k)
+                    k += 1
                 if progress:
-                    progress(i + 1, n)
-            xref = f.tell()
-            f.write(f"xref\n0 {len(offsets)}\n0000000000 65535 f \n".encode())
-            for off in offsets[1:]:
-                f.write(f"{off:010d} 00000 n \n".encode())
-            f.write(f"trailer\n<< /Size {len(offsets)} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode())
+                    progress(i + 1, len(items))
+            doc.save(tmp)
+            doc.close()
+            if img_doc:
+                img_doc.close()
         os.replace(tmp, out)
     finally:
-        if os.path.exists(tmp):
-            os.remove(tmp)
+        for p in (tmp, img_tmp):
+            if os.path.exists(p):
+                os.remove(p)
+
+
+# ---------- 轉成圖片 ----------
+
+def unique_path(folder, stem, ext):
+    """不覆蓋既有檔案：重名時加 (2)、(3)…"""
+    path, k = os.path.join(folder, stem + ext), 2
+    while os.path.exists(path):
+        path, k = os.path.join(folder, f"{stem} ({k}){ext}"), k + 1
+    return path
+
+
+def save_image(im, folder, stem, fmt, quality="high", exif=None, icc=None):
+    name, ext, modes = FORMATS[fmt]
+    if has_alpha(im) and fmt not in KEEPS_ALPHA:
+        im = flatten(im)
+    if im.mode not in modes:
+        im = im.convert("RGBA" if has_alpha(im) else "L" if im.mode == "1" and "L" in modes else "RGB")
+    options = {}
+    if fmt in LOSSY:
+        options["quality"] = QUALITY[quality]
+    if fmt == "tiff":
+        options["compression"] = "tiff_lzw"
+    if fmt in ("jpg", "png", "webp", "tiff", "avif"):
+        if exif:
+            options["exif"] = exif
+        if icc:
+            options["icc_profile"] = icc
+    path = unique_path(folder, stem, ext)
+    im.save(path, name, **options)
+    return path
+
+
+def convert_images(items, folder, fmt, quality="high", dpi=150, progress=None):
+    """items：[(路徑, 順時針旋轉角度)]；圖片各存一張，PDF 每頁存一張。回傳輸出的檔案清單。"""
+    outputs = []
+    for i, (path, rotate) in enumerate(items):
+        stem = os.path.splitext(os.path.basename(path))[0]
+        try:
+            if is_pdf(path):
+                doc = open_pdf(path)
+                for n, page in enumerate(doc, 1):
+                    pix = page.get_pixmap(dpi=dpi, alpha=False)
+                    im = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+                    if rotate:
+                        im = im.transpose(ROTATE[rotate])
+                    outputs.append(save_image(im, folder, f"{stem}_第{n}頁", fmt, quality))
+                doc.close()
+            else:
+                with Image.open(path) as im:
+                    icc = im.info.get("icc_profile")
+                    im = ImageOps.exif_transpose(im)  # 方向寫進像素，EXIF 方向標記一併移除
+                    if rotate:
+                        im = im.transpose(ROTATE[rotate])
+                    exif = im.getexif()
+                    outputs.append(save_image(im, folder, stem, fmt, quality, exif.tobytes() if exif else None, icc))
+        except Exception as e:
+            raise RuntimeError(f"{os.path.basename(path)}：{e}") from e
+        if progress:
+            progress(i + 1, len(items))
+    return outputs
 
 
 def load_preview(path, box):
-    """回傳轉正後的縮圖、轉正後的原圖尺寸與 DPI。"""
+    """回傳縮圖、轉正後的原始尺寸、DPI 與頁數（圖片為 1）。"""
+    if is_pdf(path):
+        import fitz
+        doc = open_pdf(path)
+        page, pages = doc[0], doc.page_count
+        w, h = page.rect.width, page.rect.height
+        zoom = box / max(w, h)
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+        doc.close()
+        return Image.frombytes("RGB", (pix.width, pix.height), pix.samples), (w, h), 72, pages
     with Image.open(path) as im:
         orientation = im.getexif().get(0x0112, 1)
         dpi = im.info.get("dpi", (0, 0))[0]
         w, h = im.size
-        im.draft("RGB", (box, box))
-        im = ImageOps.exif_transpose(im).convert("RGB")
+        if im.format == "JPEG":
+            im.draft("RGB", (box, box))
+        im = ImageOps.exif_transpose(im)
+        im = flatten(im) if has_alpha(im) else im.convert("RGB")
         im.thumbnail((box, box), Image.LANCZOS)
-    return im, ((h, w) if orientation in (5, 6, 7, 8) else (w, h)), dpi
+    return im, ((h, w) if orientation in (5, 6, 7, 8) else (w, h)), dpi, 1
 
 
 # ---------- 視窗 ----------
@@ -244,9 +394,11 @@ class Card(Mover):
     def __init__(self, canvas, tag, path, x, y):
         super().__init__(canvas, tag, x, y)
         self.path = path
+        self.pdf = is_pdf(path)
         self.rotate = 0
         self.thumb = self.size = self.error = None
         self.dpi = 0
+        self.pages = 1
         self.future = None
         self.photo = None
 
@@ -264,7 +416,7 @@ def run_gui(initial):
         pass
 
     root = tk.Tk()
-    root.title("JPG 轉 PDF")
+    root.title("格式轉換")
     S = root.winfo_fpixels("1i") / 96
 
     def px(v):
@@ -427,30 +579,38 @@ def run_gui(initial):
                 self.command()
 
     class Segmented(tk.Canvas):
-        """分段選擇：白色滑塊以彈簧移到選中的那一格。"""
+        """分段選擇，可排成多列：白色滑塊以彈簧移到選中的那一格。"""
 
-        def __init__(self, parent, width, options, value, command):
+        def __init__(self, parent, width, options, value, command, cols=None):
             self.options, self.command = options, command
+            self.cols = cols or len(options)
             self.enabled = True
-            h, self.pad = px(40), px(3)
+            self.pad, self.cell_h = px(3), px(34)
+            rows = math.ceil(len(options) / self.cols)
+            h = 2 * self.pad + rows * self.cell_h
             super().__init__(parent, bg=parent["bg"], width=width, height=h, highlightthickness=0, bd=0,
                              cursor="hand2")
-            self.w, self.h = width, h
-            self.seg = (width - 2 * self.pad) / len(options)
+            self.seg = (width - 2 * self.pad) / self.cols
             self.track = photo(rounded(width, h, px(10), C["track"]))
             self.create_image(0, 0, anchor="nw", image=self.track)
-            sp = px(6)
-            self.pill_pad = sp
-            self.pill = photo(rounded(round(self.seg), h - 2 * self.pad, px(8), "#ffffff", pad=sp,
+            sp = self.pill_pad = px(6)
+            self.pill = photo(rounded(round(self.seg), self.cell_h, px(8), "#ffffff", pad=sp,
                                       blur=px(3), alpha=46, dy=px(1)))
             self.index = [v for v, _ in options].index(value)
-            x0 = self.pad + self.index * self.seg - sp
-            self.create_image(x0, self.pad - sp, anchor="nw", image=self.pill, tags=("pill",))
-            self.mover = Mover(self, "pill", x0, 0, response=0.3)
+            x0, y0 = self.cell(self.index)
+            self.create_image(x0, y0, anchor="nw", image=self.pill, tags=("pill",))
+            self.mover = Mover(self, "pill", x0, y0, response=0.3)
             for i, (_, label) in enumerate(options):
-                draw_text(self, self.pad + (i + 0.5) * self.seg, h / 2, label, 16, C["ink"], tags=(f"t{i}",))
+                x, y = self.cell(i)
+                draw_text(self, x + sp + self.seg / 2, y + sp + self.cell_h / 2, label, 16, C["ink"],
+                          tags=(f"t{i}",))
             self.recolor()
             self.bind("<ButtonPress-1>", self.on_press)
+
+        def cell(self, i):
+            """第 i 格滑塊圖片的左上角（含陰影外圍）。"""
+            return (self.pad + (i % self.cols) * self.seg - self.pill_pad,
+                    self.pad + (i // self.cols) * self.cell_h - self.pill_pad)
 
         def recolor(self):
             for i in range(len(self.options)):
@@ -460,12 +620,14 @@ def run_gui(initial):
         def on_press(self, e):
             if not self.enabled:
                 return
-            i = min(len(self.options) - 1, max(0, int((e.x - self.pad) // self.seg)))
-            if i == self.index:
+            col = min(self.cols - 1, max(0, int((e.x - self.pad) // self.seg)))
+            row = max(0, int((e.y - self.pad) // self.cell_h))
+            i = row * self.cols + col
+            if i >= len(self.options) or i == self.index:
                 return
             self.index = i
             self.recolor()
-            self.mover.sx.target = self.pad + i * self.seg - self.pill_pad
+            self.mover.sx.target, self.mover.sy.target = self.cell(i)
             kick(self.mover)
             self.command(self.options[i][0])
 
@@ -477,8 +639,8 @@ def run_gui(initial):
 
     # ---------- 版面 ----------
     root.configure(bg=C["bg"])
-    root.geometry(f"{px(1120)}x{px(740)}")
-    root.minsize(px(760), px(520))
+    root.geometry(f"{px(1120)}x{px(760)}")
+    root.minsize(px(760), px(600))
 
     side_w = px(300)
     side = tk.Frame(root, bg=C["panel"], width=side_w)
@@ -490,15 +652,15 @@ def run_gui(initial):
 
     head = tk.Frame(main, bg=C["bg"])
     head.pack(fill="x", padx=px(24), pady=(px(20), px(6)))
-    TextLabel(head, "JPG 轉 PDF", 22, bold=True).pack(side="left")
+    TextLabel(head, "格式轉換", 22, bold=True).pack(side="left")
     count = TextLabel(head, "", 16, fill=C["muted"])
     count.pack(side="left", padx=px(12))
 
     grid = tk.Canvas(main, bg=C["bg"], highlightthickness=0, bd=0, yscrollincrement=1)
     grid.pack(fill="both", expand=True)
 
-    state = {"page": "a4", "orient": "auto", "margin": "none", "busy": False, "out": None,
-             "progress": None, "result": None, "drops": [], "laid_out": False}
+    state = {"to": "pdf", "page": "a4", "orient": "auto", "margin": "none", "quality": "high", "dpi": "150",
+             "busy": False, "out": None, "progress": None, "result": None, "drops": [], "laid_out": False}
     cards = []
     ids = iter(range(1, 10 ** 9))
 
@@ -508,36 +670,54 @@ def run_gui(initial):
     WELL = CW - 2 * INSET
     BOX = WELL - px(20)
     GAP, PAD = px(18), px(24)
+    BADGE = px(34)
     imgs = {
         "card": photo(rounded(CW, CH, px(14), "#ffffff", pad=SH, blur=px(5), alpha=30, dy=px(2))),
         "hover": photo(rounded(CW, CH, px(14), "#ffffff", pad=SH, blur=px(7), alpha=46, dy=px(3))),
         "lifted": photo(rounded(CW, CH, px(14), "#ffffff", pad=SH, blur=px(11), alpha=70, dy=px(8))),
         "well": photo(rounded(WELL, WELL, px(10), C["well"])),
+        "badge": photo(rounded(BADGE, px(22), px(11), C["well"])),
         "zone": None,
     }
-    BADGE = px(34)
-    imgs["badge"] = photo(rounded(BADGE, px(22), px(11), C["well"]))
 
     # ---------- 設定欄 ----------
     inner = tk.Frame(side, bg=C["panel"])
     inner.pack(fill="both", expand=True, padx=px(24), pady=px(24))
     inner_w = side_w - 2 * px(24)
-    segs = {}
+    segs, panels = {}, {}
+
+    def section(parent, key, title, options, cols=None):
+        TextLabel(parent, title, 16, bold=True).pack(anchor="w", pady=(0, px(8)))
+        segs[key] = Segmented(parent, inner_w, options, state[key], lambda v: set_option(key, v), cols)
+        segs[key].pack(anchor="w", pady=(0, px(22)))
+
+    section(inner, "to", "輸出格式", [(k, k.upper() if k != "webp" else "WebP") for k in ["pdf", *FORMATS]], cols=4)
+    for name in ("pdf", "quality", "dpi"):
+        panels[name] = tk.Frame(inner, bg=C["panel"])
+    section(panels["pdf"], "page", "頁面大小", [("a4", "A4"), ("original", "原圖大小")])
+    section(panels["pdf"], "orient", "方向", [("auto", "自動"), ("portrait", "直式"), ("landscape", "橫式")])
+    section(panels["pdf"], "margin", "邊界", [("none", "無"), ("small", "小"), ("large", "大")])
+    section(panels["quality"], "quality", "品質", [("high", "高"), ("medium", "中"), ("low", "低")])
+    section(panels["dpi"], "dpi", "PDF 解析度（DPI）", [("72", "72"), ("150", "150"), ("300", "300")])
+
+    def show_panels():
+        to = state["to"]
+        wanted = {"pdf": to == "pdf", "quality": to in LOSSY, "dpi": to != "pdf" and any(c.pdf for c in cards)}
+        for name in ("pdf", "quality", "dpi"):
+            panels[name].pack_forget()
+        for name in ("pdf", "quality", "dpi"):
+            if wanted[name]:
+                panels[name].pack(anchor="w", fill="x")
+        segs["orient"].set_enabled(state["page"] == "a4")
+        segs["margin"].set_enabled(state["page"] == "a4")
+        convert_btn.set_text(f"轉換成 {segs['to'].options[segs['to'].index][1]}")
 
     def set_option(key, value):
         state[key] = value
-        for k in ("orient", "margin"):
-            segs[k].set_enabled(state["page"] == "a4")
-        for c in cards:
-            refresh_preview(c)
-
-    for key, title, options in (
-            ("page", "頁面大小", [("a4", "A4"), ("original", "原圖大小")]),
-            ("orient", "方向", [("auto", "自動"), ("portrait", "直式"), ("landscape", "橫式")]),
-            ("margin", "邊界", [("none", "無"), ("small", "小"), ("large", "大")])):
-        TextLabel(inner, title, 16, bold=True).pack(anchor="w", pady=(0, px(8)))
-        segs[key] = Segmented(inner, inner_w, options, state[key], lambda v, k=key: set_option(k, v))
-        segs[key].pack(anchor="w", pady=(0, px(22)))
+        show_panels()
+        if key in ("to", "page", "orient", "margin"):
+            for c in cards:
+                refresh_preview(c)
 
     convert_btn = PillButton(inner, "轉換成 PDF", lambda: convert(), primary=True, width=inner_w, height=48)
     convert_btn.pack(side="bottom")
@@ -545,13 +725,13 @@ def run_gui(initial):
     result_box.pack(side="bottom", fill="x", pady=(0, px(12)))
     status = TextLabel(result_box, "", 16, fill=C["muted"], wrap=inner_w)
     status.pack(anchor="w")
-    open_btn = PillButton(result_box, "開啟 PDF", lambda: os.startfile(state["out"]), width=inner_w)
+    open_btn = PillButton(result_box, "開啟資料夾", lambda: os.startfile(state["out"]), width=inner_w)
 
     def set_status(text, color=C["muted"]):
         status.set(text, color)
 
     sort_btn = PillButton(head, "依檔名排序", lambda: sort_by_name())
-    add_btn = PillButton(head, "加入圖片", lambda: add_dialog())
+    add_btn = PillButton(head, "加入檔案", lambda: add_dialog())
     add_btn.pack(side="right")
     sort_btn.pack(side="right", padx=(0, px(8)))
 
@@ -589,9 +769,10 @@ def run_gui(initial):
         rows = math.ceil(len(cards) / cols)
         height = 2 * PAD + rows * CH + max(0, rows - 1) * GAP
         grid.configure(scrollregion=(0, 0, grid.winfo_width(), max(height, grid.winfo_height())))
-        count.set(f"{len(cards)} 張" if cards else "")
+        count.set(f"{len(cards)} 個檔案" if cards else "")
         convert_btn.set_enabled(bool(cards) and not state["busy"])
         sort_btn.set_enabled(len(cards) > 1)
+        show_panels()
         draw_empty()
         update_scrollbar()
 
@@ -611,7 +792,7 @@ def run_gui(initial):
         grid.create_image(cx, cy, image=imgs["zone"], tags=("empty", "empty_bg"))
         grid.create_image(cx, cy - px(56), image=imgs["plus"], tags=("empty",))
         grid.create_text(cx, cy - px(58), text="+", font=font(TIMES, 30), fill="#ffffff", tags=("empty",))
-        draw_text(grid, cx, cy + px(20), "選擇圖片", 22, C["ink"], tags=("empty",), bold=True)
+        draw_text(grid, cx, cy + px(20), "選擇檔案", 22, C["ink"], tags=("empty",), bold=True)
         draw_text(grid, cx, cy + px(58), "或拖曳到這裡", 13, C["muted"], tags=("empty",))
 
     def update_scrollbar():
@@ -645,8 +826,8 @@ def run_gui(initial):
                          tags=(tag, tag + "_no"))
         name = os.path.basename(path)
         name_w = CW - 2 * INSET - BADGE - px(8)
-        draw_text(grid, x + INSET + BADGE + px(8), line_y, fit(name, 13, name_w),
-                  13, C["ink"], tags=(tag,), anchor="w")
+        draw_text(grid, x + INSET + BADGE + px(8), line_y, fit(name, 13, name_w), 13, C["ink"], tags=(tag,),
+                  anchor="w")
         r = px(13)
         for kind, cx, symbol in (("rot", x + CW - INSET - px(48), "↻"), ("del", x + CW - INSET - px(18), "✕")):
             cy = y + INSET + px(18)
@@ -658,15 +839,19 @@ def run_gui(initial):
         return c
 
     def compose(c):
-        """依目前設定畫出這張的 PDF 頁面縮圖。"""
-        pw, ph, x, y, iw, ih = page_geometry(*c.size, c.dpi, state["page"], state["orient"], state["margin"])
-        s = BOX / max(pw, ph)
-        page = Image.new("RGB", (max(1, round(pw * s)), max(1, round(ph * s))), "white")
-        page.paste(c.thumb.resize((max(1, round(iw * s)), max(1, round(ih * s))), Image.LANCZOS),
-                   (round(x * s), round((ph - y - ih) * s)))
+        """依目前設定畫出這張的輸出縮圖：轉 PDF 時是頁面，轉圖片時是圖片本身。"""
+        if state["to"] == "pdf" and not c.pdf:
+            pw, ph, x, y, iw, ih = page_geometry(*c.size, c.dpi, state["page"], state["orient"], state["margin"])
+            s = BOX / max(pw, ph)
+            page = Image.new("RGB", (max(1, round(pw * s)), max(1, round(ph * s))), "white")
+            page.paste(c.thumb.resize((max(1, round(iw * s)), max(1, round(ih * s))), Image.LANCZOS),
+                       (round(x * s), round((ph - y - ih) * s)))
+        else:
+            s = BOX / max(c.thumb.size)
+            page = c.thumb.resize((max(1, round(c.thumb.width * s)), max(1, round(c.thumb.height * s))),
+                                  Image.LANCZOS)
         if c.rotate:
-            page = page.transpose({90: Image.Transpose.ROTATE_270, 180: Image.Transpose.ROTATE_180,
-                                   270: Image.Transpose.ROTATE_90}[c.rotate])
+            page = page.transpose(ROTATE[c.rotate])
         ImageDraw.Draw(page).rectangle([0, 0, page.width - 1, page.height - 1], outline="#c9d1da")
         return page
 
@@ -674,6 +859,18 @@ def run_gui(initial):
         if c.thumb is not None:
             c.photo = photo(compose(c))
             grid.itemconfigure(c.page_item, image=c.photo)
+
+    def pages_chip(c):
+        """PDF 卡片右下角標頁數。"""
+        text = f"{c.pages} 頁"
+        w = math.ceil(measure(text, 13)) + px(16)
+        key = f"chip{w}"
+        if key not in imgs:
+            imgs[key] = photo(rounded(w, px(22), px(11), "#ffffff", outline=C["line"]))
+        x, y = c.dx + CW - INSET - px(8), c.dy + INSET + WELL - px(8)
+        grid.create_image(x, y, anchor="se", image=imgs[key], tags=(c.tag,))
+        draw_text(grid, x - w / 2, y - px(11), text, 13, C["muted"], tags=(c.tag,))
+        grid.tag_raise(c.tag + "_ctl")
 
     def poll_previews():
         pending = False
@@ -684,8 +881,10 @@ def run_gui(initial):
                 pending = True
                 continue
             try:
-                c.thumb, c.size, c.dpi = c.future.result()
+                c.thumb, c.size, c.dpi, c.pages = c.future.result()
                 refresh_preview(c)
+                if c.pdf:
+                    pages_chip(c)
             except Exception:
                 c.error = True
                 draw_text(grid, c.dx + CW / 2, c.dy + INSET + WELL / 2, "無法讀取", 16, C["warn"], tags=(c.tag,))
@@ -695,19 +894,20 @@ def run_gui(initial):
 
     def add_files(paths):
         files = expand(paths)
-        keep = [p for p in files if p.lower().endswith(IMAGE_EXT) and os.path.isfile(p)]
+        keep = [p for p in files if supported(p) and os.path.isfile(p)]
         have = {c.path for c in cards}
         new = sorted({p for p in keep if p not in have}, key=natural_key)
         for p in new:
             cards.append(make_card(p))
         skipped = len(files) - len(keep)
-        set_status(f"略過 {skipped} 個非 JPG 檔案" if skipped else "", C["warn"])
+        set_status(f"略過 {skipped} 個不支援的檔案" if skipped else "", C["warn"])
         relayout()
         poll_previews()
 
     def add_dialog():
+        patterns = " ".join("*" + e for e in IMAGE_EXT + PDF_EXT)
         chosen = filedialog.askopenfilenames(
-            parent=root, title="選擇圖片", filetypes=[("JPG", "*.jpg *.jpeg"), ("所有檔案", "*.*")],
+            parent=root, title="選擇檔案", filetypes=[("圖片與 PDF", patterns), ("所有檔案", "*.*")],
             initialdir=os.path.dirname(cards[-1].path) if cards else None)
         if chosen:
             add_files(chosen)
@@ -826,7 +1026,6 @@ def run_gui(initial):
             if n:
                 grid.yview_scroll(n, "units")
                 drag_to(*drag["pointer"])
-                update_scrollbar()
             return True
 
     autoscroll = AutoScroll()
@@ -901,28 +1100,36 @@ def run_gui(initial):
         if not cards or state["busy"]:
             return
         if any(c.error for c in cards):
-            set_status("有圖片無法讀取，請先移除", C["warn"])
+            set_status("有檔案無法讀取，請先移除", C["warn"])
             return
+        to = state["to"]
         first = os.path.dirname(cards[0].path)
-        out = filedialog.asksaveasfilename(
-            parent=root, title="輸出 PDF", defaultextension=".pdf", filetypes=[("PDF", "*.pdf")],
-            initialdir=first, initialfile=(os.path.basename(first) or "output") + ".pdf")
+        if to == "pdf":
+            out = filedialog.asksaveasfilename(
+                parent=root, title="輸出 PDF", defaultextension=".pdf", filetypes=[("PDF", "*.pdf")],
+                initialdir=first, initialfile=(os.path.basename(first) or "output") + ".pdf")
+        else:
+            out = filedialog.askdirectory(parent=root, title="選擇輸出資料夾", initialdir=first)
         if not out:
             return
         out = os.path.normpath(out)
         items = [(c.path, c.rotate) for c in cards]
-        options = (state["page"], state["orient"], state["margin"])
         state.update(busy=True, result=None, progress=(0, len(items)))
         convert_btn.set_enabled(False)
         open_btn.pack_forget()
         set_status("")
 
         def work():
+            progress = lambda i, n: state.update(progress=(i, n))
             try:
-                write_pdf(items, out, *options, progress=lambda i, n: state.update(progress=(i, n)))
-                state["result"] = ("ok", out, len(items))
+                if to == "pdf":
+                    write_pdf(items, out, state["page"], state["orient"], state["margin"], progress)
+                    state["result"] = ("ok", out, f"已輸出：{os.path.basename(out)}")
+                else:
+                    files = convert_images(items, out, to, state["quality"], int(state["dpi"]), progress)
+                    state["result"] = ("ok", out, f"已輸出 {len(files)} 個檔案")
             except Exception as e:
-                state["result"] = ("error", str(e), 0)
+                state["result"] = ("error", None, f"失敗：{e}")
 
         threading.Thread(target=work, daemon=True).start()
         poll_convert()
@@ -933,16 +1140,17 @@ def run_gui(initial):
             convert_btn.set_text(f"轉換中 {i}/{n}")
             root.after(50, poll_convert)
             return
-        kind, value, n = state["result"]
+        kind, out, message = state["result"]
         state["busy"] = False
-        convert_btn.set_text("轉換成 PDF")
+        show_panels()
         convert_btn.set_enabled(bool(cards))
         if kind == "ok":
-            state["out"] = value
-            set_status(f"已輸出 {n} 頁：{os.path.basename(value)}", C["ok"])
+            state["out"] = out
+            set_status(message, C["ok"])
+            open_btn.set_text("開啟 PDF" if out.lower().endswith(".pdf") else "開啟資料夾")
             open_btn.pack(anchor="w", pady=(px(10), 0))
         else:
-            set_status(f"失敗：{value}", C["warn"])
+            set_status(message, C["warn"])
 
     # ---------- 從檔案總管拖檔進來 ----------
     def enable_drop():
@@ -1005,20 +1213,31 @@ def run_gui(initial):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="JPG 轉 PDF")
-    parser.add_argument("files", nargs="*", help="圖片或資料夾，依給定順序成頁")
-    parser.add_argument("--out", help="輸出 PDF 路徑；有給就不開視窗")
-    parser.add_argument("--page", choices=["a4", "original"], default="a4", help="a4：放進 A4；original：原圖大小")
+    parser = argparse.ArgumentParser(description="格式轉換：圖片互轉、合併成 PDF、PDF 轉圖片")
+    parser.add_argument("files", nargs="*", help="圖片、PDF 或資料夾，依給定順序處理")
+    parser.add_argument("--to", choices=["pdf", *FORMATS], help="輸出格式；沒給時依 --out 的副檔名判斷 PDF")
+    parser.add_argument("--out", help="輸出位置：轉 PDF 是檔案路徑，轉圖片是資料夾；有給就不開視窗")
+    parser.add_argument("--page", choices=["a4", "original"], default="a4", help="轉 PDF：a4 或 original（原圖大小）")
     parser.add_argument("--orient", choices=["auto", "portrait", "landscape"], default="auto",
-                        help="A4 方向；auto 依圖片直橫")
-    parser.add_argument("--margin", choices=list(MARGIN_MM), default="none", help="A4 邊界：無、10 mm、20 mm")
+                        help="轉 PDF：A4 方向；auto 依圖片直橫")
+    parser.add_argument("--margin", choices=list(MARGIN_MM), default="none", help="轉 PDF：A4 邊界，無、10 mm、20 mm")
+    parser.add_argument("--quality", choices=list(QUALITY), default="high", help="JPG、WebP、AVIF 品質：95、85、70")
+    parser.add_argument("--dpi", type=int, default=150, help="PDF 轉圖片的解析度")
     args = parser.parse_args()
     files = expand(args.files)
     if args.out:
+        to = args.to or ("pdf" if args.out.lower().endswith(".pdf") else None)
+        if to is None:
+            sys.exit("請用 --to 指定輸出格式")
         if not files:
-            sys.exit("沒有圖片")
-        write_pdf([(p, 0) for p in files], args.out, args.page, args.orient, args.margin)
-        print(f"已輸出 {len(files)} 頁：{args.out}")
+            sys.exit("沒有檔案")
+        if to == "pdf":
+            write_pdf([(p, 0) for p in files], args.out, args.page, args.orient, args.margin)
+            print(f"已輸出：{args.out}")
+        else:
+            os.makedirs(args.out, exist_ok=True)
+            outputs = convert_images([(p, 0) for p in files], args.out, to, args.quality, args.dpi)
+            print(f"已輸出 {len(outputs)} 個檔案到 {args.out}")
     else:
         run_gui(files).mainloop()
 
